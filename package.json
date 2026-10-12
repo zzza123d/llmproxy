@@ -1,0 +1,13 @@
+{
+  "name": "llmproxy",
+  "version": "2.0.1",
+  "private": true,
+  "description": "Cloudflare Worker reverse proxy for LLM APIs (OpenAI / Gemini / Groq)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
