@@ -46,6 +46,11 @@ export const PLATFORMS: Record<string, Platform> = {
         endpoint: "https://api.groq.com/openai/v1/chat/completions",
         label: "Groq",
     },
+    cmecloud: {
+        // 移动云（震泽）· 呼和浩特节点，OpenAI 兼容
+        endpoint: "https://zhenze-huhehaote.cmecloud.cn/v1/chat/completions",
+        label: "移动云（震泽）",
+    },
 };
 
 /** 返回所有受支持的平台名 */
