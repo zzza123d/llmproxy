@@ -43,7 +43,7 @@ export class OpenaiInference implements Inference {
     endpoint: string = "https://api.openai.com/v1/chat/completions";
 
     async handle(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-        return await fetch(this.endpoint, {
+        return await globalThis.fetch(this.endpoint, {
             headers: req.headers,
             method: req.method,
             body: req.body,
@@ -59,7 +59,7 @@ export class GroqInference implements Inference {
     async handle(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         let body: any = await req.json();
         body['api_key'] = parseKey(req.headers);
-        return await fetch(this.endpoint, {
+        return await globalThis.fetch(this.endpoint, {
             headers: req.headers,
             method: 'POST',
             redirect: 'follow',
@@ -114,7 +114,7 @@ export class GeminiInferece implements Inference {
         const url = `${this.endpoint}/${model}:generateContent?key=${key}`;
         const inputData = await this.prepareData(jso.messages);
         console.log(inputData);
-        const response = await fetch(url, {
+        const response = await globalThis.fetch(url, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
