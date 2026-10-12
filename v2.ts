@@ -88,12 +88,19 @@ function passthroughHeaders(req: Request): Headers {
     return h;
 }
 
-/** 构造缓存键：用 URL 对象逐段赋值，避免非法字符导致 "Invalid URL string." */
-function buildCacheKey(platform: string, hash: string): Request {
-    const u = new URL('https://llmproxy.internal/');
-    // pathname 赋值会自动做百分号编码，杜绝非法字符
-    u.pathname = `/cache/${encodeURIComponent(platform || 'unknown')}/${encodeURIComponent(hash || 'nohash')}`;
-    return new Request(u.toString(), { method: 'GET' });
+/**
+ * 构造缓存键。
+ * 返回 Request，但全程用 try/catch 包裹——任何一个 URL 解析点失败
+ * 都退化为「不使用缓存」，绝不能让它冒泡成 worker 异常。
+ */
+function buildCacheKey(platform: string, hash: string): Request | null {
+    try {
+        const u = new URL('https://llmproxy.internal/');
+        u.pathname = `/cache/${encodeURIComponent(platform || 'unknown')}/${encodeURIComponent(hash || 'nohash')}`;
+        return new Request(u.toString(), { method: 'GET' });
+    } catch (e) {
+        return null; // 放弃缓存
+    }
 }
 
 /** 统一转发：适用于所有 OpenAI 兼容平台 */
@@ -103,29 +110,40 @@ async function openaiCompat(
     endpoint: string,
     platform: string
 ): Promise<Response> {
-    const body = await req.clone().text();
+    let body = '';
+    try {
+        body = await req.clone().text();
+    } catch (e) {
+        body = '';
+    }
 
     // 基于「请求体哈希」做边缘缓存，避免重复调用消耗上游配额。
-    // 注意：cacheKey 用固定 origin，避免污染用户请求 URL。
-    let cacheKey: Request;
+    // 缓存全程容错：任何一步失败都直接跳过缓存，走真实请求。
+    let cacheKey: Request | null = null;
+    let cache: Cache | null = null;
     try {
         const hash = await sha256(body);
         cacheKey = buildCacheKey(platform, hash);
+        cache = caches.default;
     } catch (e) {
-        // 极端情况下哈希/URL 构造失败，退化为不使用缓存
-        cacheKey = buildCacheKey('nohash', String(Date.now()));
+        cacheKey = null;
+        cache = null;
     }
-    const cache = caches.default;
 
-    let hit: Response | undefined;
-    try {
-        hit = await cache.match(cacheKey);
-    } catch (e) {
-        // 缓存不可用时忽略，继续走真实请求
-        hit = undefined;
-    }
-    if (hit) {
-        return rewrap(hit, { 'x-llmproxy-cache': 'HIT' });
+    if (cacheKey && cache) {
+        let hit: Response | undefined;
+        try {
+            hit = await cache.match(cacheKey);
+        } catch (e) {
+            hit = undefined;
+        }
+        if (hit) {
+            try {
+                return rewrap(hit, { 'x-llmproxy-cache': 'HIT' });
+            } catch (e) {
+                // 缓存响应包装失败，忽略，继续走真实请求
+            }
+        }
     }
 
     // 关键防御：endpoint 必须是合法的 http(s) 绝对地址，
@@ -142,7 +160,12 @@ async function openaiCompat(
         );
     }
 
-    const upstream = await fetch(endpoint, {
+    // 注意：必须用 globalThis.fetch！
+    // 本模块导出了 `export async function fetch`，模块内的裸 `fetch(...)`
+    // 会被这个本地声明遮蔽（shadowing），导致递归调用自己——
+    // endpoint 字符串被当成 req 传入，req.url 为 undefined，
+    // 最终 new URL(undefined) 抛 TypeError: Invalid URL string.
+    const upstream = await globalThis.fetch(endpoint, {
         method: 'POST',
         headers: passthroughHeaders(req),
         body: body || undefined,
@@ -150,21 +173,21 @@ async function openaiCompat(
     });
 
     // 仅缓存成功响应，且不缓存流式输出
-    const isStream = (upstream.headers.get('content-type') || '').includes('event-stream');
-    if (upstream.ok && !isStream) {
-        const forCache = upstream.clone();
-        const cacheHeaders = new Headers(forCache.headers);
-        cacheHeaders.set('cache-control', 'max-age=300');
-        const cached = new Response(forCache.body, {
-            status: forCache.status,
-            statusText: forCache.statusText || undefined,
-            headers: cacheHeaders,
-        });
-        try {
+    try {
+        const isStream = (upstream.headers.get('content-type') || '').includes('event-stream');
+        if (cacheKey && cache && upstream.ok && !isStream) {
+            const forCache = upstream.clone();
+            const cacheHeaders = new Headers(forCache.headers);
+            cacheHeaders.set('cache-control', 'max-age=300');
+            const cached = new Response(forCache.body, {
+                status: forCache.status,
+                statusText: forCache.statusText || undefined,
+                headers: cacheHeaders,
+            });
             ctx.waitUntil(cache.put(cacheKey, cached));
-        } catch (e) {
-            // 写缓存失败不影响正常返回
         }
+    } catch (e) {
+        // 写缓存失败不影响正常返回
     }
 
     return rewrap(upstream, {
@@ -182,12 +205,19 @@ export async function fetch(
         return await route(req, env, ctx);
     } catch (e: any) {
         // 兜底：把未捕获异常转成可读 JSON，避免 Cloudflare ERROR 1101
+        let reqUrl = '<unreadable>';
+        try {
+            reqUrl = String(req.url);
+        } catch (e2) {
+            reqUrl = '<req.url threw>';
+        }
         return new Response(
             JSON.stringify({
                 error: {
                     message: e && e.message ? e.message : String(e),
                     type: 'worker_exception',
-                    stack: e && e.stack ? String(e.stack).split('\n').slice(0, 8) : undefined,
+                    reqUrl,
+                    stack: e && e.stack ? String(e.stack).split('\n').slice(0, 10) : undefined,
                 },
             }),
             { status: 500, headers: { 'content-type': 'application/json' } }
@@ -200,7 +230,18 @@ async function route(
     env: Env,
     ctx: ExecutionContext
 ): Promise<Response> {
-    const url = new URL(req.url);
+    // 防御：req.url 在极端情况下可能不是合法绝对 URL，
+    // 直接 new URL(req.url) 会抛 "Invalid URL string."。
+    let url: URL;
+    try {
+        url = new URL(req.url);
+    } catch (e) {
+        // 退而求其次：手工从 req.url 里抠出 pathname
+        const raw = String(req.url || '');
+        const m = /\/(v2|v1)(\/[^?#]*)?/.exec(raw);
+        const fallbackPath = m ? (m[1] + (m[2] || '')) : '';
+        url = new URL('https://llmproxy.invalid/' + fallbackPath.replace(/^\//, ''));
+    }
     const platform = url.pathname.split('/')[2];
 
     // 预检请求直接放行
